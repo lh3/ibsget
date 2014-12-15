@@ -60,6 +60,10 @@ char *ibs_read_all(const char *url, int *len)
 	return ret;
 }
 
+/***************
+ * Downloading *
+ ***************/
+
 int64_t ibs_download(const char *secret, const char *id, int is_stdout)
 {
 	char url[1024], *rst, *fn = 0;
@@ -90,9 +94,13 @@ int64_t ibs_download(const char *secret, const char *id, int is_stdout)
 
 	if (!is_stdout) {
 		struct stat s;
-		if (stat(fn, &s) == 0) start = s.st_size;
-		if (start == size)
-			fprintf(stderr, "[W::%s] file '%s' is complete. Downloading skipped.\n", __func__, fn);
+		if (stat(fn, &s) == 0) {
+			start = s.st_size;
+			if (start == size) {
+				fprintf(stderr, "[W::%s] file '%s' is complete. Download skipped.\n", __func__, fn);
+				goto ret_getfile;
+			} else fprintf(stderr, "[W::%s] file '%s' exists but incomplete. Start from offset %lld.\n", __func__, fn, (long long)start);
+		}
 	} else fp = stdout;
 	sprintf(url, "%s/%s/files/%s/content?access_token=%s", ibs_url, ibs_prefix, id, secret);
 	if ((ku = kurl_open(url, 0)) == 0) {
@@ -103,10 +111,12 @@ int64_t ibs_download(const char *secret, const char *id, int is_stdout)
 		fprintf(stderr, "[E::%s] file '%s' present, but 'range' is not supported. Please manually delete the file first.\n", __func__, fn);
 		goto ret_getfile;
 	}
-	if (fn && (fp = fopen(fn, "ab")) == 0) {
-		fprintf(stderr, "[E::%s] failed to create file '%s' in the working directory.\n", __func__, fn);
-		goto ret_getfile;
-	} else fprintf(stderr, "[M::%s] writing/appending to file '%s'...\n", __func__, fn);
+	if (!is_stdout) {
+		if (fn && (fp = fopen(fn, "ab")) == 0) {
+			fprintf(stderr, "[E::%s] failed to create file '%s' in the working directory.\n", __func__, fn);
+			goto ret_getfile;
+		} else fprintf(stderr, "[M::%s] writing/appending to file '%s'...\n", __func__, fn);
+	}
 
 	buf = malloc(IBS_BUFSIZE);
 	while ((l = kurl_read(ku, buf, IBS_BUFSIZE)) > 0)
@@ -121,23 +131,135 @@ ret_getfile:
 	return size;
 }
 
+/***********
+ * Listing *
+ ***********/
+
+char *ibs_get_userID(const char *secret)
+{
+	char url[1024], *rst, *id = 0;
+	int len;
+	kson_t *kson;
+	sprintf(url, "%s/%s/oauthv2/token/current?access_token=%s", ibs_url, ibs_prefix, secret);
+	rst = ibs_read_all(url, &len);
+	if ((kson = kson_parse(rst)) != 0) {
+		const kson_node_t *p;
+		if ((p = kson_by_path(kson->root, 3, "Response", "UserResourceOwner", "Id")) != 0)
+			id = strdup(p->v.str);
+		kson_destroy(kson);
+	}
+	free(rst);
+	return id;
+}
+
+static int ibs_by_sample(const char *secret, const char *sid, const char *pid, const char *pname)
+{
+	char url[1024], *rst;
+	int len, i, n = 0;
+	kson_t *kson;
+	sprintf(url, "%s/%s/samples/%s/files?access_token=%s", ibs_url, ibs_prefix, sid, secret);
+	rst = ibs_read_all(url, &len);
+	if ((kson = kson_parse(rst)) != 0) {
+		const kson_node_t *p, *q;
+		char *id;
+		int64_t size;
+		if ((p = kson_by_path(kson->root, 2, "Response", "Items")) != 0) {
+			for (i = 0; i < p->n; ++i) {
+				if ((q = kson_by_path(p, 2, i, "Id")) == 0) continue;
+				id = q->v.str;
+				if ((q = kson_by_path(p, 2, i, "Size")) == 0) continue;
+				size = atoll(q->v.str);
+				if ((q = kson_by_path(p, 2, i, "Name")) == 0) continue;
+				printf("%s\t%s\t%lld\t%s\t%s\t%s\n", id, q->v.str, (long long)size, sid, pid, pname);
+				++n;
+			}
+		}
+		kson_destroy(kson);
+	}
+	free(rst);
+	return n;
+}
+
+typedef struct {
+	char *id, *name;
+} idinfo_t;
+
+static idinfo_t *ibs_get_list(const char *secret, const char *pid, const char *ptype, const char *ctype, int *n)
+{
+	char url[1024], *rst;
+	idinfo_t *ids = 0;
+	int len, i;
+	kson_t *kson;
+	*n = 0;
+	sprintf(url, "%s/%s/%s/%s/%s?access_token=%s", ibs_url, ibs_prefix, ptype, pid, ctype, secret);
+	rst = ibs_read_all(url, &len);
+	if ((kson = kson_parse(rst)) != 0) {
+		const kson_node_t *p, *q;
+		if ((p = kson_by_path(kson->root, 2, "Response", "Items")) != 0) {
+			ids = malloc(p->n * sizeof(idinfo_t));
+			*n = p->n;
+			for (i = 0; i < p->n; ++i) {
+				ids[i].id = ids[i].name = 0;
+				if ((q = kson_by_path(p, 2, i, "Id")))
+					ids[i].id = strdup(q->v.str);
+				if ((q = kson_by_path(p, 2, i, "Name")))
+					ids[i].name = strdup(q->v.str);
+			}
+		}
+		kson_destroy(kson);
+	}
+	free(rst);
+	return ids;
+}
+
+int ibs_list(const char *secret)
+{
+	static char *top_level[] = { "projects", "runs", 0 };
+	char *uid;
+	int i, j, k, m, n;
+	if ((uid = ibs_get_userID(secret)) == 0) return 1;
+	for (k = 0; top_level[k] != 0; ++k) {
+		idinfo_t *l, *s;
+		l = ibs_get_list(secret, uid, "users", top_level[k], &n);
+		for (i = 0; i < n; ++i) {
+			s = ibs_get_list(secret, l[i].id, top_level[k], "samples", &m);
+			for (j = 0; j < m; ++j)
+				ibs_by_sample(secret, s[j].id, l[i].id, l[i].name);
+		}
+	}
+	return 0;
+}
+
+/*****************
+ * Main function *
+ *****************/
+
 int main(int argc, char *argv[])
 {
-	int i, c, is_stdout = 0;
+	int i, c, is_stdout = 0, list = 0;
 	char *secret, *fn = 0;
 
-	while ((c = getopt(argc, argv, "cs:")) == 0) {
+	while ((c = getopt(argc, argv, "lcs:")) >= 0) {
 		if (c == 's') fn = optarg;
+		else if (c == 'l') list = 1;
 		else if (c == 'c') is_stdout = 1;
 	}
-	if (optind == argc) {
-		fprintf(stderr, "Usage: ibsget [-c] [-s secretFile] <id> [id2 [...]]\n");
+	if (optind == argc && list == 0) {
+		fprintf(stderr, "Usage: ibsget [-cl] [-s secretFile] <id> [id2 [...]]\n");
+		fprintf(stderr, "Options:\n");
+		fprintf(stderr, "  -s FILE   read access_token from FILE [~/.ibssecret]\n");
+		fprintf(stderr, "  -l        list files: fileID, fileName, size, sampleID, prj/runID, prj/runName\n");
+		fprintf(stderr, "  -c        write file to stdout\n");
+		fprintf(stderr, "\nNote: check the following link about how to acquire access_token:\n");
+		fprintf(stderr, "  https://support.basespace.illumina.com/knowledgebase/articles/403618-python-run-downloader\n");
 		return 1;
 	}
 	if ((secret = ibs_read_secret(fn)) == 0) {
 		fprintf(stderr, "[E::%s] failed to read the access_token from the provided file or from '$HOME/.ibssecret'.\n", __func__);
 		return 0;
 	}
+
+	if (list) return ibs_list(secret);
 
 	kurl_init();
 	for (i = optind; i < argc; ++i)
