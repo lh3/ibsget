@@ -4,7 +4,11 @@ CPPFLAGS=
 INCLUDES=	
 OBJS=		ibsget.o kurl.o kson.o
 PROG=		ibsget
-LIBS=		-lcurl
+LIBS=		-lcurl -lssl -lcrypto -lz
+
+ifeq ($(shell uname -s),Linux)
+	LIBS += -lrt
+endif
 
 .SUFFIXES:.c .o
 
